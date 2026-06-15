@@ -1,23 +1,35 @@
-use crate::mikrotik_api::RosClient;
+use crate::dns_log;
+use crate::mikrotik_api::{AddOutcome, PipelineEntry, RosClient};
 use crate::smartdns::*;
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::CString;
-use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::Instant;
 use tokio::runtime::Builder;
 use tokio::runtime::Runtime;
-use tokio::sync::{Mutex, Semaphore};
-use tokio::time::{timeout, Duration};
+use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration, Instant};
 
 const IPV4_PATH: &str = "/ip/firewall/address-list";
 const IPV6_PATH: &str = "/ipv6/firewall/address-list";
 const DEFAULT_PORT: u16 = 8728;
 const DEFAULT_SSL_PORT: u16 = 8729;
-const CONNECTION_IDLE_TIMEOUT_SECS: u64 = 600;
-const TASK_TIMEOUT_SECS: u64 = 30;
+const QUEUE_CAPACITY: usize = 65536;
+const FLUSH_INTERVAL_MS: u64 = 200;
+const PIPELINE_SIZE: usize = 64;
+const RECONNECT_MIN_DELAY_SECS: u64 = 1;
+const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+
+/// Resolved result — IP and TTL are looked up from cache on the C callback thread.
+#[derive(Clone, Debug)]
+struct ResolvedJob {
+    group: String,
+    ip: String,
+    ttl: u32,
+    qtype: i32,
+}
 
 pub struct MikrotikPluginConfig {
     pub address: String,
@@ -39,10 +51,9 @@ impl Default for MikrotikPluginConfig {
 
 pub struct MikrotikPlugin {
     config: StdMutex<MikrotikPluginConfig>,
-    connection: Mutex<Option<(Arc<RosClient>, Instant)>>,
-    /// Serialise all RouterOS API commands to avoid internal actor races.
-    device_sem: Semaphore,
+    tx: StdMutex<Option<mpsc::Sender<ResolvedJob>>>,
     runtime: Arc<Runtime>,
+    rx: StdMutex<Option<mpsc::Receiver<ResolvedJob>>>,
 }
 
 impl MikrotikPlugin {
@@ -54,12 +65,16 @@ impl MikrotikPlugin {
             .build()
             .unwrap();
 
-        Arc::new(MikrotikPlugin {
+        let (tx, rx) = mpsc::channel::<ResolvedJob>(QUEUE_CAPACITY);
+
+        let plugin = Arc::new(MikrotikPlugin {
             config: StdMutex::new(MikrotikPluginConfig::default()),
-            connection: Mutex::new(None),
-            device_sem: Semaphore::new(1),
+            tx: StdMutex::new(Some(tx)),
             runtime: Arc::new(rt),
-        })
+            rx: StdMutex::new(Some(rx)),
+        });
+
+        plugin
     }
 
     fn load_config(&self) -> Result<(), Box<dyn Error>> {
@@ -98,22 +113,6 @@ impl MikrotikPlugin {
     pub fn start(&self, _args: &Vec<String>) -> Result<(), Box<dyn Error>> {
         self.load_config()?;
         self.validate_config()?;
-        Ok(())
-    }
-
-    pub fn stop(&self) {}
-
-    /// Return cached connection or create a new one.
-    /// Lock is held only briefly; a small race window on cache-miss is harmless.
-    async fn get_or_connect(self: &Arc<Self>) -> Result<Arc<RosClient>, String> {
-        {
-            let guard = self.connection.lock().await;
-            if let Some((ref c, t)) = *guard {
-                if t.elapsed().as_secs() < CONNECTION_IDLE_TIMEOUT_SECS {
-                    return Ok(Arc::clone(c));
-                }
-            }
-        }
 
         let (host, port, username, password) = {
             let cfg = self.config.lock().unwrap();
@@ -121,22 +120,26 @@ impl MikrotikPlugin {
             (h, p, cfg.username.clone(), cfg.password.clone())
         };
 
-        let client = RosClient::connect_and_login(&host, port, &username, &password)
-            .await
-            .map_err(|e| e.to_string())?;
-        let client = Arc::new(client);
+        let rx = self.rx.lock().unwrap().take();
+        if let Some(rx) = rx {
+            self.runtime.spawn(async move {
+                worker(rx, host, port, username, password).await;
+            });
+        }
 
-        let mut guard = self.connection.lock().await;
-        *guard = Some((Arc::clone(&client), Instant::now()));
-        Ok(client)
+        Ok(())
     }
 
-    pub fn query_complete(self: &Arc<Self>, request: Box<dyn DnsRequest>) {
-        // NEVER drop request on the C thread — ManuallyDrop skips the
-        // DnsRequest_C destructor (dns_server_request_put) which could
-        // reach back into C request cleanup from the wrong context.
-        let request = ManuallyDrop::new(request);
+    pub fn stop(&self) {
+        // Drop the sender to close the channel, signaling the worker to exit.
+        self.tx.lock().unwrap().take();
+    }
 
+    /// Called from the smartdns C callback thread.
+    /// IMPORTANT: dns_cache_lookup MUST be called here (on the main thread),
+    /// NOT from the tokio worker. Calling it from another thread causes
+    /// severe lock contention and can crash smartdns.
+    pub fn query_complete(self: &Arc<Self>, request: Box<dyn DnsRequest>) {
         let group_name = request.get_group_name();
         let domain = request.get_domain();
         let qtype = request.get_qtype() as i32;
@@ -148,46 +151,186 @@ impl MikrotikPlugin {
             return;
         }
 
-        // Do cache lookup HERE on the C thread — safe, no cross-thread races.
-        let c_domain = match CString::new(domain.as_bytes()) { Ok(c) => c, Err(_) => return };
-        let c_group = match CString::new(group_name.as_bytes()) { Ok(c) => c, Err(_) => return };
+        // Look up cache result RIGHT HERE on the C callback thread.
+        let c_domain = match CString::new(domain.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let c_group = match CString::new(group_name.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
 
         let result = match lookup_cache_result(&c_domain, qtype, &c_group) {
             Some(r) => r,
             None => return,
         };
+
         if !is_valid_ip(&result.ip) {
             return;
         }
 
-        let ip_path = if result.addr_type == DNS_T_A { IPV4_PATH } else { IPV6_PATH };
-        let ip = result.ip;
-        let ttl = result.ttl;
+        if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+            let _ = tx.try_send(ResolvedJob {
+                group: group_name,
+                ip: result.ip,
+                ttl: result.ttl,
+                qtype,
+            });
+        }
+    }
+}
 
-        let self_clone = Arc::clone(self);
+/// Worker loop: receives resolved jobs, batches, deduplicates, and sends to Mikrotik.
+/// Runs as a single async task — all RouterOS I/O is serialised through here.
+async fn worker(
+    mut rx: mpsc::Receiver<ResolvedJob>,
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+) {
+    let mut client: Option<RosClient> = None;
+    let mut reconnect_delay = RECONNECT_MIN_DELAY_SECS;
+    // Local cache: tracks (group, ip) -> ttl as last confirmed in Mikrotik.
+    // Allows skipping add for entries that already exist with sufficient TTL.
+    let mut local_cache: HashMap<(String, String), u32> = HashMap::new();
 
-        self.runtime.spawn(async move {
-            let _ = timeout(Duration::from_secs(TASK_TIMEOUT_SECS), async {
-                let client = self_clone.get_or_connect().await.ok()?;
-                let _permit = self_clone.device_sem.acquire().await.ok()?;
-                let _ = sync_address_list_entry(&client, ip_path, &group_name, &ip, ttl).await;
-                Some(())
-            })
-            .await;
+    loop {
+        // Phase 1: Collect batch within flush interval
+        let mut batch: HashMap<(String, String), (u32, i32)> = HashMap::new();
+        let deadline = Instant::now() + Duration::from_millis(FLUSH_INTERVAL_MS);
+
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(job)) => {
+                    let key = (job.group, job.ip);
+                    match batch.get_mut(&key) {
+                        Some((ttl, _)) if job.ttl > *ttl => *ttl = job.ttl,
+                        Some(_) => {}
+                        None => {
+                            batch.insert(key, (job.ttl, job.qtype));
+                        }
+                    }
+                }
+                Ok(None) => return, // channel closed — shutdown
+                Err(_) => break,   // deadline reached
+            }
+        }
+
+        if batch.is_empty() {
+            continue;
+        }
+
+        // Phase 2: Filter with local cache — skip entries already in Mikrotik with >= TTL
+        batch.retain(|key, (ttl, _)| match local_cache.get(key) {
+            Some(cached_ttl) if *cached_ttl >= *ttl => false,
+            _ => true,
         });
+
+        if batch.is_empty() {
+            continue;
+        }
+
+        // Phase 3: Ensure connection
+        if client.is_none() {
+            match RosClient::connect_and_login(&host, port, &username, &password).await {
+                Ok(c) => {
+                    client = Some(c);
+                    reconnect_delay = RECONNECT_MIN_DELAY_SECS;
+                    // Local cache may be stale after reconnect; clear and rebuild.
+                    // Entries already in Mikrotik will produce Duplicate and be re-cached.
+                    local_cache.clear();
+                    dns_log!(LogLevel::INFO, "mikrotik-api: connected to {}:{}", host, port);
+                }
+                Err(e) => {
+                    dns_log!(LogLevel::ERROR, "mikrotik-api: connect failed: {}", e);
+                    sleep(Duration::from_secs(reconnect_delay)).await;
+                    reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX_DELAY_SECS);
+                    continue;
+                }
+            }
+        }
+
+        // Phase 4: Pipeline-add entries in chunks
+        let entries: Vec<_> = batch.into_iter().collect();
+        let mut cache_updates: Vec<((String, String), u32)> = Vec::new();
+        let mut connection_ok = true;
+
+        for chunk in entries.chunks(PIPELINE_SIZE) {
+            let pipeline_entries: Vec<PipelineEntry> = chunk
+                .iter()
+                .map(|((group, ip), (ttl, qtype))| {
+                    let ip_path = if *qtype == DNS_T_A {
+                        IPV4_PATH
+                    } else {
+                        IPV6_PATH
+                    };
+                    PipelineEntry {
+                        ip_path,
+                        list: group,
+                        address: ip,
+                        ttl: *ttl,
+                    }
+                })
+                .collect();
+
+            let results = client.as_ref().unwrap().pipeline_add(&pipeline_entries).await;
+
+            for (((group, ip), (ttl, _)), result) in chunk.iter().zip(results.iter()) {
+                match result {
+                    Ok(AddOutcome::Added) | Ok(AddOutcome::Duplicate) => {
+                        cache_updates.push(((group.clone(), ip.clone()), *ttl));
+                    }
+                    Err(e) => {
+                        dns_log!(
+                            LogLevel::WARN,
+                            "mikrotik-api: add failed for {}/{}: {}",
+                            group,
+                            ip,
+                            e
+                        );
+                        connection_ok = false;
+                    }
+                }
+            }
+
+            if !connection_ok {
+                break;
+            }
+        }
+
+        // Update local cache only for successful entries
+        for (key, ttl) in cache_updates {
+            local_cache.insert(key, ttl);
+        }
+
+        // Periodically evict stale entries from local cache to bound memory.
+        // Simple approach: if cache is too large, clear it (will rebuild naturally).
+        if local_cache.len() > 100_000 {
+            local_cache.clear();
+        }
+
+        // Handle connection errors — reconnect with exponential backoff
+        if !connection_ok {
+            dns_log!(LogLevel::WARN, "mikrotik-api: connection error, will reconnect");
+            client = None;
+            sleep(Duration::from_secs(reconnect_delay)).await;
+            reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX_DELAY_SECS);
+        } else {
+            reconnect_delay = RECONNECT_MIN_DELAY_SECS;
+        }
     }
 }
 
 fn is_valid_ip(ip: &str) -> bool {
     if let Ok(ipv4) = ip.parse::<Ipv4Addr>() {
-        if ipv4.is_unspecified() || ipv4.is_loopback() || ipv4.is_multicast() || ipv4.is_broadcast() {
+        if ipv4.is_unspecified() || ipv4.is_loopback() || ipv4.is_multicast() || ipv4.is_broadcast()
+        {
             return false;
         }
         let o = ipv4.octets();
-        if o[0] == 0 {
-            return false;
-        }
-        if o[0] == 100 {
+        if o[0] == 0 || o[0] == 100 {
             return false;
         }
         if o[0] == 169 && o[1] == 254 {
@@ -223,47 +366,17 @@ fn is_valid_ip(ip: &str) -> bool {
     false
 }
 
-async fn sync_address_list_entry(
-    client: &Arc<RosClient>,
-    ip_path: &str,
-    list: &str,
-    address: &str,
-    ttl: u32,
-) -> Result<(), String> {
-    let entry_id = client
-        .find_entry_id(ip_path, list, address)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    match entry_id {
-        Some(id) => {
-            if let Ok(Some(existing)) = client.get_entry_timeout(ip_path, &id).await {
-                if ttl > existing {
-                    client
-                        .update_address_list_timeout(ip_path, &id, ttl)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-        None => {
-            client
-                .add_address_list_entry(ip_path, list, address, ttl)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
 fn parse_address(address: &str, ssl: bool) -> (String, u16) {
-    let dp = if ssl { DEFAULT_SSL_PORT } else { DEFAULT_PORT };
+    let dp = if ssl {
+        DEFAULT_SSL_PORT
+    } else {
+        DEFAULT_PORT
+    };
     if let Some(ci) = address.rfind(':') {
         if let Some(bi) = address.rfind(']') {
             if bi < ci {
-                let h = &address[1..bi];
                 if let Ok(p) = address[ci + 1..].parse() {
-                    return (h.into(), p);
+                    return (address[1..bi].into(), p);
                 }
             }
         }

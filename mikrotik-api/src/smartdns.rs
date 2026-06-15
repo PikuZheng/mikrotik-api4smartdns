@@ -296,8 +296,7 @@ extern "C" fn dns_request_complete(request: *mut smartdns_c::dns_request) {
         }
 
         let ops = ops.unwrap();
-        // Borrowed — C owns the ref; ManuallyDrop in plugin.rs skips `dns_server_request_put`.
-        let req = DnsRequest_C::new_borrowed(request);
+        let req = DnsRequest_C::new(request);
         ops.server_query_complete(Box::new(req));
     }
 }
