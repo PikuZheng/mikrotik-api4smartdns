@@ -1,9 +1,6 @@
-name: Docker Image CI with ui
+name: build
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
       
 jobs:
   build: 
@@ -27,7 +24,9 @@ jobs:
           echo "CUR_VERSION=$VERSION" >> $GITHUB_ENV
       - name: build
         run: |
-          sudo timedatectl set-timezone "Asia/Shanghai"
+          rm docker-build.sh || true
+          cat >> docker-build.sh << EOF
+          export RUSTFLAGS='-C link-arg=-Wl,-rpath,./ -C target-feature=-crt-static'
           cd ${{ github.workspace }}/mikrotik-api
           mkdir -p release
           if  test "$GOARCH" = "armv7" ;then
@@ -36,6 +35,12 @@ jobs:
           else
             cargo build --release --target=$GOARCH-unknown-linux-musl
             cp ./target/$GOARCH-unknown-linux-musl/release/libmikrotik_api.so ./build
+          fi
+          EOF
+          if  test "$GOARCH" = "armv7" ;then
+            docker run -i --rm -v ${{ github.workspace }}:/workdir messense/rust-musl-cross:armv7-musleabihf sh /workdir/docker-build.sh
+          else
+            docker run -i --rm -v ${{ github.workspace }}:/workdir messense/rust-musl-cross:$GOARCH-musl sh /workdir/docker-build.sh
           fi
       - name: general tag and release file
         id: tag
