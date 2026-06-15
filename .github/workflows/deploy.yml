@@ -24,11 +24,12 @@ jobs:
           echo "CUR_VERSION=$VERSION" >> $GITHUB_ENV
       - name: build
         run: |
+          cd ${{ github.workspace }}
           rm docker-build.sh || true
           cat >> docker-build.sh << EOF
+          cd /workdir/mikrotik-api
           export RUSTFLAGS='-C link-arg=-Wl,-rpath,./ -C target-feature=-crt-static'
-          cd ${{ github.workspace }}/mikrotik-api
-          mkdir -p release
+          mkdir -p build
           if  test "$GOARCH" = "armv7" ;then
             cargo build --release --target=armv7-unknown-linux-musleabihf
             cp ./target/armv7-unknown-linux-musleabihf/release/libmikrotik_api.so ./build
@@ -59,4 +60,4 @@ jobs:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           body_path: release.txt
           files: |
-            ${{ github.workspace }}/build/*
+            ${{ github.workspace }}/mikrotik-api/build/*
