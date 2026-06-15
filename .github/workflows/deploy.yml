@@ -1,0 +1,58 @@
+name: Docker Image CI with ui
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      
+jobs:
+  build: 
+    needs: get-version
+    strategy:
+      matrix:
+        goarch: [x86_64, aarch64, armv7]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    env:
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: docker/setup-qemu-action@v2
+      - uses: docker/setup-buildx-action@v2
+        with:
+          install: true
+      - name: Extract version from Cargo.toml
+        id: extract_version
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "CUR_VERSION=$VERSION" >> $GITHUB_ENV
+      - name: build
+        run: |
+          sudo timedatectl set-timezone "Asia/Shanghai"
+          cd ${{ github.workspace }}/mikrotik-api
+          mkdir -p release
+          if  test "$GOARCH" = "armv7" ;then
+            cargo build --release --target=armv7-unknown-linux-musleabihf
+            cp ./target/armv7-unknown-linux-musleabihf/release/libmikrotik_api.so ./build
+          else
+            cargo build --release --target=$GOARCH-unknown-linux-musl
+            cp ./target/$GOARCH-unknown-linux-musl/release/libmikrotik_api.so ./build
+          fi
+      - name: general tag and release file
+        id: tag
+        run: |
+          cd ${{ github.workspace }}
+          echo "release_tag=$GOARCH-${{ env.CUR_VERSION }}" >> $GITHUB_OUTPUT
+          touch release.txt
+          echo ${{ github.sha }} >> release.txt
+          echo "status=success" >> $GITHUB_OUTPUT
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@v1
+        if: steps.tag.outputs.status == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          files: |
+            ${{ github.workspace }}/build/*
