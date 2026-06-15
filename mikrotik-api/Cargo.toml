@@ -1,0 +1,27 @@
+[package]
+name = "mikrotik-api"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+ctor = "0.4.3"
+tokio = { version = "1.50.0", features = ["full"] }
+mikrotik-rs = "0.8"
+
+[features]
+build-release = []
+default = []
+
+[build-dependencies]
+bindgen = "0.69.5"
+
+[profile.release-optmize-size]
+inherits = "release"
+lto = true
+opt-level = "s"
+strip = true
+codegen-units = 1
+panic = "abort"
