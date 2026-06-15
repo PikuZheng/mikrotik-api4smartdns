@@ -7,7 +7,6 @@ on:
       
 jobs:
   build: 
-    needs: get-version
     strategy:
       matrix:
         goarch: [x86_64, aarch64, armv7]
