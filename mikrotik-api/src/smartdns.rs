@@ -87,6 +87,14 @@ pub struct DnsResult {
 
 /// Look up a single IP result from the DNS cache for a (domain, qtype, group) key.
 /// Called after query completion when the result should be in cache.
+///
+/// IMPORTANT: The cache data is always `dns_cache_packet` (raw DNS packet bytes),
+/// NOT `dns_cache_addr`. The `dns_cache_addr` struct is defined in the header but
+/// never actually used by the C code. Casting to it reads past the allocation,
+/// causing SIGSEGV on small DNS packets.
+///
+/// Both `dns_cache_release(cache)` AND `dns_cache_data_put(data)` must be called
+/// before returning to avoid refcount leaks.
 pub fn lookup_cache_result(c_domain: &CStr, qtype: i32, c_group: &CStr) -> Option<DnsResult> {
     unsafe {
         let mut key = smartdns_c::dns_cache_key {
@@ -101,8 +109,8 @@ pub fn lookup_cache_result(c_domain: &CStr, qtype: i32, c_group: &CStr) -> Optio
             return None;
         }
 
-        let ttl = smartdns_c::dns_cache_get_ttl(cache) as u32;
-        if ttl <= 0 {
+        let cache_ttl = smartdns_c::dns_cache_get_ttl(cache) as u32;
+        if cache_ttl == 0 {
             smartdns_c::dns_cache_release(cache);
             return None;
         }
@@ -113,34 +121,136 @@ pub fn lookup_cache_result(c_domain: &CStr, qtype: i32, c_group: &CStr) -> Optio
             return None;
         }
 
-        // Cast cache_data to dns_cache_addr to read IP bytes
-        let addr_data = data as *const smartdns_c::dns_cache_addr;
-        let addr = &(*addr_data).addr_data;
+        // The cache data is always dns_cache_packet (raw DNS packet).
+        // Layout: dns_cache_data_head (size field = packet_len), then packet bytes.
+        let head = &(*data).head;
+        let packet_len = head.size as usize;
 
-        let ip_str = match qtype {
-            DNS_T_A => {
-                let ipv4_bytes = addr.__bindgen_anon_1.ipv4_addr.as_ref();
-                let ipv4 = Ipv4Addr::from(*ipv4_bytes);
-                ipv4.to_string()
-            }
-            DNS_T_AAAA => {
-                let ipv6_bytes = addr.__bindgen_anon_1.ipv6_addr.as_ref();
-                let ipv6 = Ipv6Addr::from(*ipv6_bytes);
-                ipv6.to_string()
-            }
-            _ => {
-                smartdns_c::dns_cache_release(cache);
-                return None;
-            }
-        };
+        // Bounds check: packet must be at least DNS header size (12 bytes) and
+        // must fit within the allocated data region.
+        let head_size = std::mem::size_of::<smartdns_c::dns_cache_data_head>();
+        if packet_len < 12 || packet_len > 65535 {
+            smartdns_c::dns_cache_data_put(data);
+            smartdns_c::dns_cache_release(cache);
+            return None;
+        }
 
+        let packet_start = (data as *const u8).add(head_size);
+        let packet_bytes = std::slice::from_raw_parts(packet_start, packet_len);
+
+        let result = parse_dns_packet_for_ip(packet_bytes, qtype);
+
+        smartdns_c::dns_cache_data_put(data);
         smartdns_c::dns_cache_release(cache);
 
-        Some(DnsResult {
-            ip: ip_str,
+        // Use cache_ttl (remaining cache lifetime) as the MikroTik timeout.
+        // Do NOT use record_ttl — it can be 0 (common in DNS responses for
+        // non-cacheable records), which would create a permanent entry in
+        // MikroTik (timeout=0 = never expires) and cause repeated add attempts.
+        result.map(|(ip, _record_ttl)| DnsResult {
+            ip,
             addr_type: qtype,
-            ttl,
+            ttl: cache_ttl,
         })
+    }
+}
+
+/// Parse a raw DNS response packet and extract the first A or AAAA record.
+/// Returns (ip_string, record_ttl) or None.
+fn parse_dns_packet_for_ip(packet: &[u8], qtype: i32) -> Option<(String, u32)> {
+    // DNS header: 12 bytes
+    if packet.len() < 12 {
+        return None;
+    }
+
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    if ancount == 0 {
+        return None;
+    }
+
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+
+    // Skip header (12 bytes)
+    let mut pos: usize = 12;
+
+    // Skip question section
+    for _ in 0..qdcount {
+        pos = skip_dns_name(packet, pos)?;
+        // QTYPE (2) + QCLASS (2)
+        pos = pos.checked_add(4)?;
+    }
+
+    // Parse answer section — find the first matching A or AAAA record
+    for _ in 0..ancount {
+        pos = skip_dns_name(packet, pos)?;
+
+        // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes minimum
+        if pos + 10 > packet.len() {
+            return None;
+        }
+
+        let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        let ttl = u32::from_be_bytes([
+            packet[pos + 4],
+            packet[pos + 5],
+            packet[pos + 6],
+            packet[pos + 7],
+        ]);
+        let rdlength = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
+        pos += 10;
+
+        if pos + rdlength > packet.len() {
+            return None;
+        }
+
+        let target_rtype = if qtype == DNS_T_A { 1u16 } else { 28u16 };
+        if rtype == target_rtype {
+            if qtype == DNS_T_A && rdlength == 4 {
+                let ip = Ipv4Addr::new(
+                    packet[pos],
+                    packet[pos + 1],
+                    packet[pos + 2],
+                    packet[pos + 3],
+                );
+                return Some((ip.to_string(), ttl));
+            } else if qtype == DNS_T_AAAA && rdlength == 16 {
+                let ip = Ipv6Addr::from([
+                    packet[pos], packet[pos + 1], packet[pos + 2], packet[pos + 3],
+                    packet[pos + 4], packet[pos + 5], packet[pos + 6], packet[pos + 7],
+                    packet[pos + 8], packet[pos + 9], packet[pos + 10], packet[pos + 11],
+                    packet[pos + 12], packet[pos + 13], packet[pos + 14], packet[pos + 15],
+                ]);
+                return Some((ip.to_string(), ttl));
+            }
+        }
+
+        pos = pos.checked_add(rdlength)?;
+    }
+
+    None
+}
+
+/// Skip a DNS name field (handles both labels and compression pointers).
+fn skip_dns_name(packet: &[u8], mut pos: usize) -> Option<usize> {
+    let mut jumps = 0u8;
+    loop {
+        if pos >= packet.len() {
+            return None;
+        }
+        let b = packet[pos];
+        if b == 0 {
+            return Some(pos + 1);
+        }
+        if (b & 0xC0) == 0xC0 {
+            // Compressed name pointer — 2 bytes total
+            return Some(pos + 2);
+        }
+        let len = (b & 0x3F) as usize;
+        pos = pos.checked_add(len + 1)?;
+        jumps = jumps.checked_add(1)?;
+        if jumps > 127 {
+            return None; // prevent infinite loops from malformed packets
+        }
     }
 }
 
@@ -288,17 +398,19 @@ static SMARTDNS_OPS: smartdns_c::smartdns_operations = smartdns_c::smartdns_oper
 
 #[no_mangle]
 extern "C" fn dns_request_complete(request: *mut smartdns_c::dns_request) {
-    unsafe {
+    // catch_unwind prevents a Rust panic from unwinding through C frames,
+    // which is undefined behavior and would crash the process.
+    let _ = std::panic::catch_unwind(|| unsafe {
         let plugin_addr = std::ptr::addr_of_mut!(PLUGIN);
         let ops = (*plugin_addr).ops.as_ref();
-        if let None = ops {
+        if ops.is_none() {
             return;
         }
 
         let ops = ops.unwrap();
         let req = DnsRequest_C::new(request);
         ops.server_query_complete(Box::new(req));
-    }
+    });
 }
 
 #[no_mangle]

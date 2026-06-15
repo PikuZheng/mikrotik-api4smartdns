@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::CString;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::runtime::Builder;
@@ -21,10 +22,14 @@ const FLUSH_INTERVAL_MS: u64 = 200;
 const PIPELINE_SIZE: usize = 64;
 const RECONNECT_MIN_DELAY_SECS: u64 = 1;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+/// Minimum TTL to add an entry. Entries with TTL below this are skipped
+/// because they'd expire almost immediately and create unnecessary churn.
+const MIN_TTL_SECS: u32 = 3;
 
 /// Resolved result — IP and TTL are looked up from cache on the C callback thread.
 #[derive(Clone, Debug)]
 struct ResolvedJob {
+    domain: String,
     group: String,
     ip: String,
     ttl: u32,
@@ -54,6 +59,7 @@ pub struct MikrotikPlugin {
     tx: StdMutex<Option<mpsc::Sender<ResolvedJob>>>,
     runtime: Arc<Runtime>,
     rx: StdMutex<Option<mpsc::Receiver<ResolvedJob>>>,
+    stopped: AtomicBool,
 }
 
 impl MikrotikPlugin {
@@ -72,6 +78,7 @@ impl MikrotikPlugin {
             tx: StdMutex::new(Some(tx)),
             runtime: Arc::new(rt),
             rx: StdMutex::new(Some(rx)),
+            stopped: AtomicBool::new(false),
         });
 
         plugin
@@ -131,15 +138,22 @@ impl MikrotikPlugin {
     }
 
     pub fn stop(&self) {
-        // Drop the sender to close the channel, signaling the worker to exit.
+        self.stopped.store(true, Ordering::Relaxed);
+        // Drop the sender to close the channel, causing the worker's
+        // rx.recv() to return None and exit.
         self.tx.lock().unwrap().take();
     }
 
     /// Called from the smartdns C callback thread.
-    /// IMPORTANT: dns_cache_lookup MUST be called here (on the main thread),
+    /// IMPORTANT: dns_cache_lookup MUST be called here (on the C callback thread),
     /// NOT from the tokio worker. Calling it from another thread causes
     /// severe lock contention and can crash smartdns.
     pub fn query_complete(self: &Arc<Self>, request: Box<dyn DnsRequest>) {
+        // Fast path: skip everything if stopped (atomic read, no mutex)
+        if self.stopped.load(Ordering::Relaxed) {
+            return;
+        }
+
         let group_name = request.get_group_name();
         let domain = request.get_domain();
         let qtype = request.get_qtype() as i32;
@@ -170,8 +184,11 @@ impl MikrotikPlugin {
             return;
         }
 
+        // Briefly lock to access sender; mutex held for only the try_send call.
+        // The stopped flag ensures we never reach here after stop().
         if let Some(tx) = self.tx.lock().unwrap().as_ref() {
             let _ = tx.try_send(ResolvedJob {
+                domain,
                 group: group_name,
                 ip: result.ip,
                 ttl: result.ttl,
@@ -192,13 +209,13 @@ async fn worker(
 ) {
     let mut client: Option<RosClient> = None;
     let mut reconnect_delay = RECONNECT_MIN_DELAY_SECS;
-    // Local cache: tracks (group, ip) -> ttl as last confirmed in Mikrotik.
-    // Allows skipping add for entries that already exist with sufficient TTL.
-    let mut local_cache: HashMap<(String, String), u32> = HashMap::new();
+    // Local cache: tracks (group, ip) -> (ttl_sent, added_at) as last confirmed in Mikrotik.
+    // Allows skipping add for entries that already exist with sufficient remaining TTL.
+    let mut local_cache: HashMap<(String, String), (u32, Instant)> = HashMap::new();
 
     loop {
         // Phase 1: Collect batch within flush interval
-        let mut batch: HashMap<(String, String), (u32, i32)> = HashMap::new();
+        let mut batch: HashMap<(String, String), (u32, i32, String)> = HashMap::new();
         let deadline = Instant::now() + Duration::from_millis(FLUSH_INTERVAL_MS);
 
         loop {
@@ -206,10 +223,13 @@ async fn worker(
                 Ok(Some(job)) => {
                     let key = (job.group, job.ip);
                     match batch.get_mut(&key) {
-                        Some((ttl, _)) if job.ttl > *ttl => *ttl = job.ttl,
+                        Some((ttl, _, domain)) if job.ttl > *ttl => {
+                            *ttl = job.ttl;
+                            *domain = job.domain;
+                        }
                         Some(_) => {}
                         None => {
-                            batch.insert(key, (job.ttl, job.qtype));
+                            batch.insert(key, (job.ttl, job.qtype, job.domain));
                         }
                     }
                 }
@@ -222,10 +242,22 @@ async fn worker(
             continue;
         }
 
-        // Phase 2: Filter with local cache — skip entries already in Mikrotik with >= TTL
-        batch.retain(|key, (ttl, _)| match local_cache.get(key) {
-            Some(cached_ttl) if *cached_ttl >= *ttl => false,
-            _ => true,
+        // Phase 2: Filter with local cache and minimum TTL.
+        // - Skip entries whose MikroTik entry still has enough remaining TTL.
+        // - Skip entries with TTL below MIN_TTL_SECS (would expire too quickly).
+        batch.retain(|key, (ttl, _, _)| {
+            if *ttl < MIN_TTL_SECS {
+                return false;
+            }
+            match local_cache.get(key) {
+                Some((cached_ttl, added_at)) => {
+                    let elapsed = added_at.elapsed().as_secs() as u32;
+                    let remaining = cached_ttl.saturating_sub(elapsed);
+                    // Skip if the MikroTik entry still has enough time remaining
+                    remaining < *ttl
+                }
+                None => true,
+            }
         });
 
         if batch.is_empty() {
@@ -260,7 +292,7 @@ async fn worker(
         for chunk in entries.chunks(PIPELINE_SIZE) {
             let pipeline_entries: Vec<PipelineEntry> = chunk
                 .iter()
-                .map(|((group, ip), (ttl, qtype))| {
+                .map(|((group, ip), (ttl, qtype, domain))| {
                     let ip_path = if *qtype == DNS_T_A {
                         IPV4_PATH
                     } else {
@@ -270,6 +302,7 @@ async fn worker(
                         ip_path,
                         list: group,
                         address: ip,
+                        domain,
                         ttl: *ttl,
                     }
                 })
@@ -277,7 +310,7 @@ async fn worker(
 
             let results = client.as_ref().unwrap().pipeline_add(&pipeline_entries).await;
 
-            for (((group, ip), (ttl, _)), result) in chunk.iter().zip(results.iter()) {
+            for (((group, ip), (ttl, _, _)), result) in chunk.iter().zip(results.iter()) {
                 match result {
                     Ok(AddOutcome::Added) | Ok(AddOutcome::Duplicate) => {
                         cache_updates.push(((group.clone(), ip.clone()), *ttl));
@@ -300,13 +333,27 @@ async fn worker(
             }
         }
 
-        // Update local cache only for successful entries
+        // Update local cache only for successful entries (store ttl + timestamp)
+        let now = Instant::now();
         for (key, ttl) in cache_updates {
-            local_cache.insert(key, ttl);
+            local_cache.insert(key, (ttl, now));
         }
 
-        // Periodically evict stale entries from local cache to bound memory.
-        // Simple approach: if cache is too large, clear it (will rebuild naturally).
+        // Periodically evict expired entries from local cache to bound memory.
+        let mut evict_count = 0;
+        local_cache.retain(|_, (ttl, added_at)| {
+            let remaining = ttl.saturating_sub(added_at.elapsed().as_secs() as u32);
+            if remaining > 0 {
+                true
+            } else {
+                evict_count += 1;
+                false
+            }
+        });
+        if evict_count > 0 {
+            dns_log!(LogLevel::INFO, "mikrotik-api: evicted {} expired local cache entries", evict_count);
+        }
+        // Safety net: if cache is still too large, clear it
         if local_cache.len() > 100_000 {
             local_cache.clear();
         }

@@ -14,6 +14,7 @@ pub struct PipelineEntry<'a> {
     pub ip_path: &'a str,
     pub list: &'a str,
     pub address: &'a str,
+    pub domain: &'a str,
     pub ttl: u32,
 }
 
@@ -53,16 +54,18 @@ impl RosClient {
         ip_path: &str,
         list: &str,
         address: &str,
+        domain: &str,
         ttl: u32,
     ) -> io::Result<AddOutcome> {
         let ttl_str = ttl.to_string();
+        let comment = format!("smartdns: {}", domain);
         let path = format!("{}/add", ip_path);
         let cmd = CommandBuilder::new()
             .command(&path)
             .attribute("list", Some(list))
             .attribute("address", Some(address))
             .attribute("timeout", Some(&ttl_str))
-            .attribute("comment", Some("smartdns"))
+            .attribute("comment", Some(&comment))
             .build();
 
         let mut rx = self.device.send_command(cmd).await.map_err(other_err)?;
@@ -111,6 +114,7 @@ impl RosClient {
                 continue;
             }
 
+            let comment = format!("smartdns: {}", entry.domain);
             let ttl_str = entry.ttl.to_string();
             let path = format!("{}/add", entry.ip_path);
             let cmd = CommandBuilder::new()
@@ -118,7 +122,7 @@ impl RosClient {
                 .attribute("list", Some(entry.list))
                 .attribute("address", Some(entry.address))
                 .attribute("timeout", Some(&ttl_str))
-                .attribute("comment", Some("smartdns"))
+                .attribute("comment", Some(&comment))
                 .build();
 
             match self.device.send_command(cmd).await {
