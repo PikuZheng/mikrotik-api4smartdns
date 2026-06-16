@@ -18,7 +18,7 @@ jobs:
           path: smartdns
       - uses: actions/checkout@v3
         with:
-          path: smartdns/plugin/mikrotik-api
+          path: smartdns/plugin
       - uses: docker/setup-qemu-action@v2
       - uses: docker/setup-buildx-action@v2
         with:
@@ -26,15 +26,15 @@ jobs:
       - name: Extract version from Cargo.toml
         id: extract_version
         run: |
-          cd ${{ github.workspace }}/smartdns/plugin/mikrotik-api/mikrotik-api
+          cd ${{ github.workspace }}/smartdns/plugin/mikrotik-api
           VERSION=$(grep '^version =' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           echo "CUR_VERSION=$VERSION" >> $GITHUB_ENV
       - name: build
         run: |
-          cd ${{ github.workspace }}/smartdns/plugin/mikrotik-api/mikrotik-api
+          cd ${{ github.workspace }}/smartdns/plugin/mikrotik-api
           rm docker-build.sh || true
           cat >> docker-build.sh << EOF
-          cd /workdir/smartdns/plugin/mikrotik-api/mikrotik-api
+          cd /workdir/smartdns/plugin/mikrotik-api
           export RUSTFLAGS='-C link-arg=-Wl,-rpath,./ -C target-feature=-crt-static'
           mkdir -p build
           if  test "$GOARCH" = "armv7" ;then
@@ -46,14 +46,14 @@ jobs:
           fi
           EOF
           if  test "$GOARCH" = "armv7" ;then
-            docker run -i --rm -v ${{ github.workspace }}:/workdir messense/rust-musl-cross:armv7-musleabihf sh /workdir/smartdns/plugin/mikrotik-api/mikrotik-api/docker-build.sh
+            docker run -i --rm -v ${{ github.workspace }}:/workdir messense/rust-musl-cross:armv7-musleabihf sh /workdir/smartdns/plugin/mikrotik-api/docker-build.sh
           else
-            docker run -i --rm -v ${{ github.workspace }}:/workdir messense/rust-musl-cross:$GOARCH-musl sh /workdir/smartdns/plugin/mikrotik-api/mikrotik-api/docker-build.sh
+            docker run -i --rm -v ${{ github.workspace }}:/workdir messense/rust-musl-cross:$GOARCH-musl sh /workdir/smartdns/plugin/mikrotik-api/docker-build.sh
           fi
       - name: general tag and release file
         id: tag
         run: |
-          cd ${{ github.workspace }}/smartdns/plugin/mikrotik-api/mikrotik-api
+          cd ${{ github.workspace }}/smartdns/plugin/mikrotik-api
           echo "release_tag=$GOARCH-${{ env.CUR_VERSION }}" >> $GITHUB_OUTPUT
           touch release.txt
           echo ${{ github.sha }} >> release.txt
@@ -65,6 +65,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.TOKEN }}
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
-          body_path: ${{ github.workspace }}/smartdns/plugin/mikrotik-api/mikrotik-api/release.txt
+          body_path: ${{ github.workspace }}/smartdns/plugin/mikrotik-api/release.txt
           files: |
-            ${{ github.workspace }}/smartdns/plugin/mikrotik-api/mikrotik-api/build/*
+            ${{ github.workspace }}/smartdns/plugin/mikrotik-api/build/*
