@@ -1,7 +1,8 @@
 # mikrotik-api4smartdns
 
 一个 smartdns 的插件，用于将 smartdns 的解析结果通过 mikrotik 的 api 写入 RouterBOARD 设备的 /ip/firewall/address-list。
-其中 list 对应 smartdns 的 group 名称，timeout 对应 ttl（默认组不传）。
+其中 list 对应 smartdns 的 group 名称，timeout 对应 ttl（默认组不传）。  
+list 条目增加可能比 dns 应答慢约 37ms。
 
 注意：我不懂 C++ 也不懂 Rust，纯 AI 编程（当前是 Deepseek-V4-Pro），发现 BUG 需要你自己修，增删功能也需要你自己改。
 
