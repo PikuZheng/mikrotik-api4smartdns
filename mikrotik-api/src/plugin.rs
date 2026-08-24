@@ -26,6 +26,16 @@ const RECONNECT_MAX_DELAY_SECS: u64 = 30;
 /// because they'd expire almost immediately and create unnecessary churn.
 const MIN_TTL_SECS: u32 = 3;
 
+/// When a MikroTik address-list entry already exists (RouterOS returns
+/// `Duplicate` on `add`), the `add` command does NOT refresh its timeout.
+/// If the timeout we want to set diverges from the estimated remaining
+/// timeout (tracked in local_cache) by more than this threshold (in seconds),
+/// we must issue an explicit `set` to refresh it. Without this, local_cache
+/// would believe the entry still has enough lifetime and skip all future
+/// updates, leaving the firewall entry to expire while the DNS cache is still
+/// valid ("DNS has it, firewall doesn't").
+const TIMEOUT_REFRESH_THRESHOLD_SECS: u32 = 3;
+
 /// Resolved result — IP and TTL are looked up from cache on the C callback thread.
 #[derive(Clone, Debug)]
 struct ResolvedJob {
@@ -287,6 +297,9 @@ async fn worker(
         // Phase 4: Pipeline-add entries in chunks
         let entries: Vec<_> = batch.into_iter().collect();
         let mut cache_updates: Vec<((String, String), u32)> = Vec::new();
+        // Entries that already exist (Duplicate) but whose timeout needs to be
+        // refreshed via an explicit `set` (see TIMEOUT_REFRESH_THRESHOLD_SECS).
+        let mut refresh_list: Vec<((String, String), u32, String)> = Vec::new();
         let mut connection_ok = true;
 
         for chunk in entries.chunks(PIPELINE_SIZE) {
@@ -310,10 +323,43 @@ async fn worker(
 
             let results = client.as_ref().unwrap().pipeline_add(&pipeline_entries).await;
 
-            for (((group, ip), (ttl, _, _)), result) in chunk.iter().zip(results.iter()) {
+            for (((group, ip), (ttl, _, _)), result, pe) in
+                chunk.iter().zip(results.iter()).zip(pipeline_entries.iter())
+            {
                 match result {
-                    Ok(AddOutcome::Added) | Ok(AddOutcome::Duplicate) => {
+                    Ok(AddOutcome::Added) => {
                         cache_updates.push(((group.clone(), ip.clone()), *ttl));
+                    }
+                    Ok(AddOutcome::Duplicate) => {
+                        // RouterOS `add` does NOT refresh the timeout of an
+                        // existing entry. If the timeout we want to set diverges
+                        // from the estimated remaining timeout by more than the
+                        // threshold, force a `set` so the firewall entry does not
+                        // expire early while the DNS cache is still valid —
+                        // otherwise local_cache would keep skipping future
+                        // updates and we'd end up with "DNS has it, firewall
+                        // doesn't".
+                        let needs_refresh = match local_cache.get(&(group.clone(), ip.clone())) {
+                            Some((cached_ttl, added_at)) => {
+                                let elapsed = added_at.elapsed().as_secs() as u32;
+                                let remaining = cached_ttl.saturating_sub(elapsed);
+                                let diff = if *ttl > remaining {
+                                    *ttl - remaining
+                                } else {
+                                    remaining - *ttl
+                                };
+                                diff > TIMEOUT_REFRESH_THRESHOLD_SECS
+                            }
+                            None => true,
+                        };
+                        cache_updates.push(((group.clone(), ip.clone()), *ttl));
+                        if needs_refresh {
+                            refresh_list.push((
+                                (group.clone(), ip.clone()),
+                                *ttl,
+                                pe.ip_path.to_string(),
+                            ));
+                        }
                     }
                     Err(e) => {
                         dns_log!(
@@ -330,6 +376,40 @@ async fn worker(
 
             if !connection_ok {
                 break;
+            }
+        }
+
+        // Refresh timeouts for entries that existed (Duplicate) but whose actual
+        // remaining timeout diverged too far from the desired value. RouterOS
+        // `add` leaves the old timeout in place, so we explicitly `set` it here.
+        if connection_ok {
+            let client_ref = client.as_ref().unwrap();
+            for ((group, ip), ttl, ip_path) in refresh_list {
+                match client_ref.find_entry_id(&ip_path, &group, &ip).await {
+                    Ok(Some(id)) => {
+                        if let Err(e) = client_ref.update_timeout(&ip_path, &id, ttl).await {
+                            dns_log!(
+                                LogLevel::WARN,
+                                "mikrotik-api: update timeout failed for {}/{}: {}",
+                                group,
+                                ip,
+                                e
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        // Entry is gone; it will be re-added on the next pass.
+                    }
+                    Err(e) => {
+                        dns_log!(
+                            LogLevel::WARN,
+                            "mikrotik-api: find entry failed for {}/{}: {}",
+                            group,
+                            ip,
+                            e
+                        );
+                    }
+                }
             }
         }
 
