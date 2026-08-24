@@ -323,7 +323,7 @@ async fn worker(
 
             let results = client.as_ref().unwrap().pipeline_add(&pipeline_entries).await;
 
-            for (((group, ip), (ttl, _, _)), (result, pe)) in
+            for ((((group, ip), (ttl, _, _)), result), pe) in
                 chunk.iter().zip(results.iter()).zip(pipeline_entries.iter())
             {
                 match result {
