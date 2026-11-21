@@ -8,6 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -22,6 +23,15 @@ const FLUSH_INTERVAL_MS: u64 = 200;
 const PIPELINE_SIZE: usize = 64;
 const RECONNECT_MIN_DELAY_SECS: u64 = 1;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+const DEFAULT_CONNECTIONS: usize = 1;
+const MAX_CONNECTIONS: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionSelection {
+    RoundRobin,
+    Random,
+}
+
 /// Minimum TTL to add an entry. Entries with TTL below this are skipped
 /// because they'd expire almost immediately and create unnecessary churn.
 const MIN_TTL_SECS: u32 = 3;
@@ -51,6 +61,8 @@ pub struct MikrotikPluginConfig {
     pub username: String,
     pub password: String,
     pub ssl: bool,
+    pub connections: usize,
+    pub selection: ConnectionSelection,
 }
 
 impl Default for MikrotikPluginConfig {
@@ -60,6 +72,8 @@ impl Default for MikrotikPluginConfig {
             username: String::new(),
             password: String::new(),
             ssl: false,
+            connections: DEFAULT_CONNECTIONS,
+            selection: ConnectionSelection::RoundRobin,
         }
     }
 }
@@ -110,6 +124,31 @@ impl MikrotikPlugin {
                 || ssl_val == "1"
                 || ssl_val.eq_ignore_ascii_case("true");
         }
+        if let Some(conn_val) = Plugin::dns_conf_plugin_config("mikrotik-api.connections") {
+            match conn_val.trim().parse::<usize>() {
+                Ok(n) if n > 0 => config.connections = n.min(MAX_CONNECTIONS),
+                _ => dns_log!(
+                    LogLevel::WARN,
+                    "mikrotik-api: invalid connections value '{}', using {}",
+                    conn_val,
+                    config.connections
+                ),
+            }
+        }
+        if let Some(sel_val) = Plugin::dns_conf_plugin_config("mikrotik-api.selection") {
+            config.selection = match sel_val.trim().to_ascii_lowercase().as_str() {
+                "random" | "rand" => ConnectionSelection::Random,
+                "round-robin" | "roundrobin" | "rr" => ConnectionSelection::RoundRobin,
+                _ => {
+                    dns_log!(
+                        LogLevel::WARN,
+                        "mikrotik-api: invalid selection value '{}', using round-robin",
+                        sel_val
+                    );
+                    ConnectionSelection::RoundRobin
+                }
+            };
+        }
         Ok(())
     }
 
@@ -131,16 +170,42 @@ impl MikrotikPlugin {
         self.load_config()?;
         self.validate_config()?;
 
-        let (host, port, username, password) = {
+        let (host, port, username, password, connections, selection) = {
             let cfg = self.config.lock().unwrap();
             let (h, p) = parse_address(&cfg.address, cfg.ssl);
-            (h, p, cfg.username.clone(), cfg.password.clone())
+            (
+                h,
+                p,
+                cfg.username.clone(),
+                cfg.password.clone(),
+                cfg.connections,
+                cfg.selection,
+            )
         };
 
         let rx = self.rx.lock().unwrap().take();
         if let Some(rx) = rx {
+            let mut worker_txs = Vec::with_capacity(connections);
+            for worker_id in 0..connections {
+                let (worker_tx, worker_rx) = mpsc::channel::<ResolvedJob>(QUEUE_CAPACITY);
+                let (worker_host, worker_user, worker_pass) =
+                    (host.clone(), username.clone(), password.clone());
+                self.runtime.spawn(async move {
+                    worker(
+                        worker_id,
+                        worker_rx,
+                        worker_host,
+                        port,
+                        worker_user,
+                        worker_pass,
+                    )
+                    .await;
+                });
+                worker_txs.push(worker_tx);
+            }
+
             self.runtime.spawn(async move {
-                worker(rx, host, port, username, password).await;
+                dispatch_jobs(rx, worker_txs, selection).await;
             });
         }
 
@@ -208,9 +273,86 @@ impl MikrotikPlugin {
     }
 }
 
+struct ConnectionSelector {
+    mode: ConnectionSelection,
+    len: usize,
+    next: usize,
+    rng: u64,
+}
+
+impl ConnectionSelector {
+    fn new(mode: ConnectionSelection, len: usize) -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        Self {
+            mode,
+            len,
+            next: 0,
+            rng: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
+        }
+    }
+
+    fn next_index(&mut self) -> usize {
+        match self.mode {
+            ConnectionSelection::RoundRobin => {
+                let index = self.next;
+                self.next = (self.next + 1) % self.len;
+                index
+            }
+            ConnectionSelection::Random => {
+                self.rng ^= self.rng << 13;
+                self.rng ^= self.rng >> 7;
+                self.rng ^= self.rng << 17;
+                (self.rng as usize) % self.len
+            }
+        }
+    }
+}
+
+/// Distributes jobs across worker-owned connections. A full worker channel is
+/// skipped when possible so one slow connection does not stall all workers.
+async fn dispatch_jobs(
+    mut rx: mpsc::Receiver<ResolvedJob>,
+    workers: Vec<mpsc::Sender<ResolvedJob>>,
+    mode: ConnectionSelection,
+) {
+    let len = workers.len();
+    if len == 0 {
+        return;
+    }
+    let mut selector = ConnectionSelector::new(mode, len);
+
+    while let Some(job) = rx.recv().await {
+        let preferred = selector.next_index();
+        let mut pending = Some(job);
+        let mut delivered = false;
+
+        for offset in 0..len {
+            let index = (preferred + offset) % len;
+            match workers[index].try_send(pending.take().unwrap()) {
+                Ok(()) => {
+                    delivered = true;
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Full(returned)) => pending = Some(returned),
+                Err(mpsc::error::TrySendError::Closed(returned)) => pending = Some(returned),
+            }
+        }
+
+        if !delivered {
+            if workers[preferred].send(pending.unwrap()).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// Worker loop: receives resolved jobs, batches, deduplicates, and sends to Mikrotik.
-/// Runs as a single async task — all RouterOS I/O is serialised through here.
+/// Each worker owns one RouterOS connection; RouterOS I/O within a worker is serial.
 async fn worker(
+    worker_id: usize,
     mut rx: mpsc::Receiver<ResolvedJob>,
     host: String,
     port: u16,
@@ -283,10 +425,21 @@ async fn worker(
                     // Local cache may be stale after reconnect; clear and rebuild.
                     // Entries already in Mikrotik will produce Duplicate and be re-cached.
                     local_cache.clear();
-                    dns_log!(LogLevel::INFO, "mikrotik-api: connected to {}:{}", host, port);
+                    dns_log!(
+                        LogLevel::INFO,
+                        "mikrotik-api: worker {} connected to {}:{}",
+                        worker_id,
+                        host,
+                        port
+                    );
                 }
                 Err(e) => {
-                    dns_log!(LogLevel::ERROR, "mikrotik-api: connect failed: {}", e);
+                    dns_log!(
+                        LogLevel::ERROR,
+                        "mikrotik-api: worker {} connect failed: {}",
+                        worker_id,
+                        e
+                    );
                     sleep(Duration::from_secs(reconnect_delay)).await;
                     reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX_DELAY_SECS);
                     continue;
@@ -440,7 +593,11 @@ async fn worker(
 
         // Handle connection errors — reconnect with exponential backoff
         if !connection_ok {
-            dns_log!(LogLevel::WARN, "mikrotik-api: connection error, will reconnect");
+            dns_log!(
+                LogLevel::WARN,
+                "mikrotik-api: worker {} connection error, will reconnect",
+                worker_id
+            );
             client = None;
             sleep(Duration::from_secs(reconnect_delay)).await;
             reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX_DELAY_SECS);

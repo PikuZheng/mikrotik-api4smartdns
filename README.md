@@ -20,6 +20,10 @@ mikrotik-api.address mikrotik的ip和端口号，例如192.168.1.96:8728
 mikrotik-api.username 具有api，read，write权限的用户的用户名
 mikrotik-api.password 上面用户对应的密码
 mikrotik-api.ssl 是否使用api-ssl连接，填yes或no
+mikrotik-api.connections 并行连接数，默认1，最大4；增大后可缓解API排队延迟
+mikrotik-api.selection 连接分配方式，round-robin（默认）或random
 ```
+
+`connections > 1` 时会启动对应数量的 worker，每个 worker 使用独立的 RouterOS API 连接；任务按 `selection` 指定的方式分配。增大该值会同时增加 RouterOS 侧 API 会话数和 SmartDNS 进程内存占用。
 
 
