@@ -25,6 +25,10 @@ const RECONNECT_MIN_DELAY_SECS: u64 = 1;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
 const DEFAULT_CONNECTIONS: usize = 1;
 const MAX_CONNECTIONS: usize = 4;
+const LOCAL_CACHE_MAX_ENTRIES: usize = 100_000;
+const CACHE_CLEANUP_INTERVAL_SECS: u64 = 30;
+
+type LocalCache = Arc<StdMutex<HashMap<(String, String), (u32, Instant)>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionSelection {
@@ -83,6 +87,7 @@ pub struct MikrotikPlugin {
     tx: StdMutex<Option<mpsc::Sender<ResolvedJob>>>,
     runtime: Arc<Runtime>,
     rx: StdMutex<Option<mpsc::Receiver<ResolvedJob>>>,
+    local_cache: LocalCache,
     stopped: AtomicBool,
 }
 
@@ -102,6 +107,7 @@ impl MikrotikPlugin {
             tx: StdMutex::new(Some(tx)),
             runtime: Arc::new(rt),
             rx: StdMutex::new(Some(rx)),
+            local_cache: Arc::new(StdMutex::new(HashMap::new())),
             stopped: AtomicBool::new(false),
         });
 
@@ -190,6 +196,7 @@ impl MikrotikPlugin {
                 let (worker_tx, worker_rx) = mpsc::channel::<ResolvedJob>(QUEUE_CAPACITY);
                 let (worker_host, worker_user, worker_pass) =
                     (host.clone(), username.clone(), password.clone());
+                let worker_cache = self.local_cache.clone();
                 self.runtime.spawn(async move {
                     worker(
                         worker_id,
@@ -198,11 +205,27 @@ impl MikrotikPlugin {
                         port,
                         worker_user,
                         worker_pass,
+                        worker_cache,
                     )
                     .await;
                 });
                 worker_txs.push(worker_tx);
             }
+
+            let cleanup_cache = self.local_cache.clone();
+            self.runtime.spawn(async move {
+                loop {
+                    sleep(Duration::from_secs(CACHE_CLEANUP_INTERVAL_SECS)).await;
+                    let removed = prune_local_cache(&cleanup_cache);
+                    if removed > 0 {
+                        dns_log!(
+                            LogLevel::INFO,
+                            "mikrotik-api: cleaned {} expired local cache entries",
+                            removed
+                        );
+                    }
+                }
+            });
 
             self.runtime.spawn(async move {
                 dispatch_jobs(rx, worker_txs, selection).await;
@@ -271,6 +294,25 @@ impl MikrotikPlugin {
             });
         }
     }
+}
+
+fn prune_local_cache(cache: &LocalCache) -> usize {
+    let mut cache = cache.lock().unwrap();
+    let mut removed = 0;
+    cache.retain(|_, (ttl, added_at)| {
+        let remaining = ttl.saturating_sub(added_at.elapsed().as_secs() as u32);
+        if remaining > 0 {
+            true
+        } else {
+            removed += 1;
+            false
+        }
+    });
+    if cache.len() > LOCAL_CACHE_MAX_ENTRIES {
+        removed += cache.len();
+        cache.clear();
+    }
+    removed
 }
 
 struct ConnectionSelector {
@@ -358,12 +400,10 @@ async fn worker(
     port: u16,
     username: String,
     password: String,
+    local_cache: LocalCache,
 ) {
     let mut client: Option<RosClient> = None;
     let mut reconnect_delay = RECONNECT_MIN_DELAY_SECS;
-    // Local cache: tracks (group, ip) -> (ttl_sent, added_at) as last confirmed in Mikrotik.
-    // Allows skipping add for entries that already exist with sufficient remaining TTL.
-    let mut local_cache: HashMap<(String, String), (u32, Instant)> = HashMap::new();
 
     loop {
         // Phase 1: Collect batch within flush interval
@@ -397,20 +437,23 @@ async fn worker(
         // Phase 2: Filter with local cache and minimum TTL.
         // - Skip entries whose MikroTik entry still has enough remaining TTL.
         // - Skip entries with TTL below MIN_TTL_SECS (would expire too quickly).
-        batch.retain(|key, (ttl, _, _)| {
-            if *ttl < MIN_TTL_SECS {
-                return false;
-            }
-            match local_cache.get(key) {
-                Some((cached_ttl, added_at)) => {
-                    let elapsed = added_at.elapsed().as_secs() as u32;
-                    let remaining = cached_ttl.saturating_sub(elapsed);
-                    // Skip if the MikroTik entry still has enough time remaining
-                    remaining < *ttl
+        {
+            let cache = local_cache.lock().unwrap();
+            batch.retain(|key, (ttl, _, _)| {
+                if *ttl < MIN_TTL_SECS {
+                    return false;
                 }
-                None => true,
-            }
-        });
+                match cache.get(key) {
+                    Some((cached_ttl, added_at)) => {
+                        let elapsed = added_at.elapsed().as_secs() as u32;
+                        let remaining = cached_ttl.saturating_sub(elapsed);
+                        // Skip if the MikroTik entry still has enough time remaining
+                        remaining < *ttl
+                    }
+                    None => true,
+                }
+            });
+        }
 
         if batch.is_empty() {
             continue;
@@ -424,7 +467,7 @@ async fn worker(
                     reconnect_delay = RECONNECT_MIN_DELAY_SECS;
                     // Local cache may be stale after reconnect; clear and rebuild.
                     // Entries already in Mikrotik will produce Duplicate and be re-cached.
-                    local_cache.clear();
+                    local_cache.lock().unwrap().clear();
                     dns_log!(
                         LogLevel::INFO,
                         "mikrotik-api: worker {} connected to {}:{}",
@@ -492,7 +535,11 @@ async fn worker(
                         // otherwise local_cache would keep skipping future
                         // updates and we'd end up with "DNS has it, firewall
                         // doesn't".
-                        let needs_refresh = match local_cache.get(&(group.clone(), ip.clone())) {
+                        let needs_refresh = match local_cache
+                            .lock()
+                            .unwrap()
+                            .get(&(group.clone(), ip.clone()))
+                        {
                             Some((cached_ttl, added_at)) => {
                                 let elapsed = added_at.elapsed().as_secs() as u32;
                                 let remaining = cached_ttl.saturating_sub(elapsed);
@@ -568,27 +615,20 @@ async fn worker(
 
         // Update local cache only for successful entries (store ttl + timestamp)
         let now = Instant::now();
-        for (key, ttl) in cache_updates {
-            local_cache.insert(key, (ttl, now));
+        {
+            let mut cache = local_cache.lock().unwrap();
+            for (key, ttl) in cache_updates {
+                cache.insert(key, (ttl, now));
+            }
         }
 
-        // Periodically evict expired entries from local cache to bound memory.
-        let mut evict_count = 0;
-        local_cache.retain(|_, (ttl, added_at)| {
-            let remaining = ttl.saturating_sub(added_at.elapsed().as_secs() as u32);
-            if remaining > 0 {
-                true
-            } else {
-                evict_count += 1;
-                false
-            }
-        });
+        let evict_count = prune_local_cache(&local_cache);
         if evict_count > 0 {
-            dns_log!(LogLevel::INFO, "mikrotik-api: evicted {} expired local cache entries", evict_count);
-        }
-        // Safety net: if cache is still too large, clear it
-        if local_cache.len() > 100_000 {
-            local_cache.clear();
+            dns_log!(
+                LogLevel::INFO,
+                "mikrotik-api: evicted {} expired local cache entries",
+                evict_count
+            );
         }
 
         // Handle connection errors — reconnect with exponential backoff
